@@ -1,0 +1,377 @@
+---
+title: "CD4Tcell_extraction_Azimuth"
+author: "Daiki Takeuchi, Yoshiaki Yasumizu"
+date: "2022/04/23"
+output: html_notebook
+---
+
+# Ensure
+
+```{r Ensure, eval=FALSE, include=FALSE}
+# Ensure Seurat v4.0 or higher is installed
+if (packageVersion(pkg = "Seurat") < package_version(x = "4.0.0")) {
+  stop("Mapping datasets requires Seurat v4 or higher.", call. = FALSE)
+}
+
+# Ensure glmGamPoi is installed
+if (!requireNamespace("glmGamPoi", quietly = TRUE)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    BiocManager::install("glmGamPoi")
+  }
+}
+
+# Ensure Azimuth is installed
+if (packageVersion(pkg = "Azimuth") < package_version(x = "0.3.1")) {
+  stop("Please install azimuth - remotes::install_github('satijalab/azimuth')", call. = FALSE)
+}
+```
+
+# 1. Library
+
+```{r library}
+library(Seurat)
+library(SeuratData)
+library(Azimuth)
+library(patchwork)
+library(tidyverse)
+library(sctransform)
+```
+
+# 2. Parameter setting
+
+```{r parameter setting}
+project.name <- c("GSE157278")
+select.CD4T.meta.data <- c("orig.ident", "Cell", "sample", "disease", "disease_duration",
+                           "condition", "age", "sex", "immunosuppressant", "immunosuppressant_duration",
+                           "batch")
+genes <- c("CD3E", "CD4", "CD8A", "FOXP3", "IL7R",
+           "CD74")
+prefix_data <- paste0("../../data/", project.name, "/")
+prefix_output <- paste0("../../output/", project.name, "/", project.name)
+```
+
+# 3. Load the reference
+
+```{r Load_the_reference}
+reference <- LoadReference(path = "https://seurat.nygenome.org/azimuth/references/v1.0.0/human_pbmc")
+```
+
+# 4. Reading data(query object)
+
+## 4-1. Read10x
+
+```{r reading data}
+query.data <- Read10X(data.dir = prefix_data)
+query <- CreateSeuratObject(counts = query.data,
+                            project = project.name,
+                            min.cells = 3,
+                            min.features = 200)
+query
+```
+
+```{r pbmc@assays}
+query@assays[["RNA"]]@counts[1:10,1:20]
+```
+
+## 4-2. Loading batch_file and metadata
+
+```{r loading batch_file and metadata}
+batch <- read_table(paste0(prefix_data, "/cell_batch.tsv.gz"))
+
+batch_select <- query@assays[["RNA"]]@data@Dimnames[[2]] %>%
+  tibble()
+colnames(batch_select) <- c("Cell")
+batch <- right_join(batch,
+                    batch_select,
+                    by = "Cell")
+
+batch <- batch %>%
+  mutate(sample = batch) %>%
+  mutate(disease = recode(sample,
+                          "HC-1" = "healthy",
+                          "HC-2" = "healthy",
+                          "HC-3" = "healthy",
+                          "HC-4" = "healthy",
+                          "HC-5" = "healthy",
+                          "pSS-1" = "sjögren's syndrome",
+                          "pSS-2" = "sjögren's syndrome",
+                          "pSS-3" = "sjögren's syndrome",
+                          "pSS-4" = "sjögren's syndrome",
+                          "pSS-5" = "sjögren's syndrome")) %>%
+  mutate(disease_duration = NA) %>%
+  mutate(condition = recode(sample,
+                            "HC-1" = "healthy",
+                            "HC-2" = "healthy",
+                            "HC-3" = "healthy",
+                            "HC-4" = "healthy",
+                            "HC-5" = "healthy",
+                            "pSS-1" = "primary sjögren's syndrome",
+                            "pSS-2" = "primary sjögren's syndrome",
+                            "pSS-3" = "primary sjögren's syndrome",
+                            "pSS-4" = "primary sjögren's syndrome",
+                            "pSS-5" = "primary sjögren's syndrome")) %>%
+  mutate(sex = recode(sample,
+                      "HC-1" = "female",
+                      "HC-2" = "female",
+                      "HC-3" = "female",
+                      "HC-4" = "female",
+                      "HC-5" = "female",
+                      "pSS-1" = "female",
+                      "pSS-2" = "female",
+                      "pSS-3" = "female",
+                      "pSS-4" = "female",
+                      "pSS-5" = "female")) %>%
+  mutate(age = NA) %>%
+  mutate(immunosuppressant = NA) %>%
+  mutate(immunosuppressant_duration = NA) 
+  
+batch <- batch %>%
+  relocate(Cell,
+           sample,
+           disease,
+           disease_duration,
+           condition,
+           age,
+           sex,
+           immunosuppressant,
+           immunosuppressant_duration,
+           batch)
+
+rownames(batch) <- batch$Cell
+
+query <- AddMetaData(query,
+                     metadata = batch)
+```
+
+# 5. Preprocessing
+
+```{r preprocessing}
+query <- PercentageFeatureSet(query,
+                              pattern = "^MT-",
+                              col.name = "percent.mt")
+head(query@meta.data, 5)
+```
+
+```{r QC_ViolinPlot}
+options(repr.plot.width = 8, repr.plot.height = 5)
+
+VlnPlot(query,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol = 3,
+        pt.size = 0)
+ggsave(paste0(prefix_output, "_check_QC_vlnPlot_CD4T_extraction.pdf"),
+       width = 5,
+       height = 10)
+```
+
+```{r QC_subset}
+query <- subset(query,
+                subset = nFeature_RNA > 200 & percent.mt < 10)
+```
+
+# 6. SCTransform Normalization
+
+```{r sctransform_normalization}
+query <- SCTransform(object = query,
+                     assay = "RNA",
+                     new.assay.name = "refAssay",
+                     residual.features = rownames(x = reference$map),
+                     reference.SCT.model = reference$map[["refAssay"]]@SCTModel.list$refmodel,
+                     method = "glmGamPoi",
+                     ncells = 2000,
+                     n_genes = 2000,
+                     do.correct.umi = FALSE,
+                     do.scale = FALSE,
+                     do.center = TRUE)
+```
+
+# 7. Find anchors between query and reference
+
+```{r Find anchors between query and reference}
+anchors <- FindTransferAnchors(reference = reference$map,
+                               query = query,
+                               k.filter = NA,
+                               reference.neighbors = "refdr.annoy.neighbors",
+                               reference.assay = "refAssay",
+                               query.assay = "refAssay",
+                               reference.reduction = "refDR",
+                               normalization.method = "SCT",
+                               features = intersect(rownames(x = reference$map),
+                                                    VariableFeatures(object = query)),
+                               dims = 1:50,
+                               n.trees = 20,
+                               mapping.score.k = 100)
+```
+
+# 8. Transfer cell type labels and impute protein expression
+
+```{r Transfer cell type labels and impute protein expression}
+refdata <- lapply(X = "celltype.l1",
+                  function(x) {
+                    reference$map[[x, drop = TRUE]]
+                    })
+names(x = refdata) <- "celltype.l1"
+if (TRUE) {
+  refdata[["impADT"]] <- GetAssayData(
+    object = reference$map[['ADT']],
+    slot = 'data'
+  )
+}
+
+query <- TransferData(reference = reference$map,
+                      query = query,
+                      dims = 1:50,
+                      anchorset = anchors,
+                      refdata = refdata,
+                      n.trees = 20,
+                      store.weights = TRUE)
+```
+
+# 9. Calculate the embeddings of the query data on the reference SPCA
+
+```{r Calculate the embeddings of the query data on the reference SPCA}
+query <- IntegrateEmbeddings(anchorset = anchors,
+                             reference = reference$map,
+                             query = query,
+                             reductions = "pcaproject",
+                             reuse.weights.matrix = TRUE)
+```
+
+# 10. Calculate the query neighbors in the reference with respect to the integrated embeddings
+
+```{r Calculate the query neighbors}
+query[["query_ref.nn"]] <- FindNeighbors(object = Embeddings(reference$map[["refDR"]]),
+                                         query = Embeddings(query[["integrated_dr"]]),
+                                         return.neighbor = TRUE,
+                                         l2.norm = TRUE)
+```
+
+# 11. NNTransform correcting the Neighbors to account for the downsampling
+
+```{r NNTransform}
+query <- Azimuth:::NNTransform(object = query,
+                               meta.data = reference$map[[]])
+```
+
+# 12. Project the query to the reference UMAP
+```{r Project the query to the reference UMAP}
+query[["proj.umap"]] <- RunUMAP(object = query[["query_ref.nn"]],
+                                reduction.model = reference$map[["refUMAP"]],
+                                reduction.key = 'UMAP_')
+```
+
+# 13. Calculate mapping score and add to metadata
+
+```{r Calculate mapping score and add to metadata}
+query <- AddMetaData(object = query,
+                     metadata = MappingScore(anchors = anchors),
+                     col.name = "mapping.score")
+```
+
+# 14. Visualizations
+
+```{r predicted metadata field}
+id <- "celltype.l1"
+predicted.id <- paste0("predicted.", id)
+
+# DimPlot of the reference
+#DimPlot(object = reference$plot,
+#        reduction = "refUMAP",
+#        group.by = id,
+#        label = TRUE) + NoLegend()
+
+# DimPlot of the query, colored by predicted cell type
+DimPlot(object = query,
+        reduction = "proj.umap",
+        group.by = predicted.id,
+        label = TRUE) + NoLegend()
+ggsave(paste0(prefix_output, "_check_dimplot_CD4T_extraction.pdf"),
+       width = 5,
+       height = 10)
+
+## Plot the score for the predicted cell type of the query
+#FeaturePlot(object = query,
+#            features = paste0(predicted.id, ".score"),
+#            reduction = "proj.umap")
+#VlnPlot(object = query,
+#        features = paste0(predicted.id, ".score"),
+#        group.by = predicted.id,
+#        pt.size = 0) + NoLegend()
+
+# Plot the mapping score
+#FeaturePlot(object = query,
+#            features = "mapping.score",
+#            reduction = "proj.umap")
+#VlnPlot(object = query,
+#        features = "mapping.score",
+#        group.by = predicted.id,
+#        pt.size = 0) + NoLegend()
+```
+
+# 15. Check
+
+## 15-1. Dot Plot
+
+```{r DotPlot for finding CD4+Tcell}
+options(repr.plot.width = 10, repr.plot.height = 8)
+
+DotPlot(object = query,
+        features = genes,
+        group.by = predicted.id) + RotatedAxis()
+
+ggsave(paste0(prefix_output, "_check_dotplot_CD4T_extraction.pdf"),
+       width = 5,
+       height = 10)
+```
+
+## 15-2. Feature Plot
+
+```{r FeaturePlot for finding CD4+Tcell}
+options(repr.plot.width = 10, repr.plot.height = 8)
+
+FeaturePlot(object = query,
+            features = genes,
+            reduction = "proj.umap",
+            ncol = 2,
+            raster = TRUE)
+
+ggsave(paste0(prefix_output, "_check_featureplot_CD4T_extraction.pdf"),
+       width = 10,
+       height = 20)
+```
+
+# 16. Extraction of CD4+Tcell
+
+```{r Extraction of CD4+Tcell}
+pbmc_CD4T <- subset(query,
+                    predicted.celltype.l1 == "CD4 T")
+
+pbmc_CD4T.meta.data <- pbmc_CD4T@meta.data
+pbmc_CD4T.meta.data <- pbmc_CD4T.meta.data %>%
+  select(all_of(select.CD4T.meta.data))
+
+pbmc_CD4T <- GetAssayData(object = pbmc_CD4T,
+                          slot = "data")
+```
+
+# 17. saveRDS
+
+```{r saveRDS}
+saveRDS(pbmc_CD4T.meta.data,
+        file = paste0(prefix_output, "_CD4T_MetaData.rds"))
+
+saveRDS(pbmc_CD4T,
+        file = paste0(prefix_output, "_CD4T_AssayData.rds"))
+```
+
+# 18. Save workspace
+
+```{r save.image}
+save.image(file = paste0(prefix_output, "_220423_CD4Tcell_extraction_Azimuth.RData"))
+```
+
+# 19. sessionInfo
+
+```{r sessionInfo}
+sessionInfo()
+```

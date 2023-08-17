@@ -1,0 +1,315 @@
+---
+title: "Reference Mapping"
+author: "Daiki Takeuchi, Yoshiaki Yasumizu"
+date: "2022/04/23"
+output: html_notebook
+---
+
+# 1. Library and source
+```{r library and source}
+library(symphony)
+library(Seurat)
+library(SeuratData)
+library(SeuratDisk)
+library(tidyverse)
+library(Matrix)
+library(sctransform)
+
+source("../symphony/vignettes/utils_seurat.R")
+```
+
+# 2. Parameter setting
+
+```{r parameter setting}
+project.name <- c("GSE157278")
+
+vars.obj <- c("sample")
+vars.query <- c("batch")
+
+genes <- c("CD3E", "MS4A1", "CST3", "CD4", "CD8A",
+           "TBX21", "GATA3", "RORC", "FOXP3", "CCR8",
+           "IL2RA", "S1PR1", "CCR7", "IL7R", "FAS",
+           "CD28", "CTLA4", "IKZF4", "NRP1", "BCL6",
+           "CXCR5", "TOX", "CSF2", "MX1")
+
+prefix_load <- c("../../data/")
+prefix_data <- paste0("../../data/", project.name, "/")
+prefix_output <- paste0("../../output/", project.name, "/", project.name)
+
+c1 <- c("sample")
+c2 <- c("sex")
+c3 <- c("project_name", "Cell", "sample", "disease", "disease_duration",
+        "condition", "age", "sex", "immunosuppressant", "immunosuppressant_duration",
+        "batch")
+treg <- c("TregAct", "TregInt", "TregNaive")
+```
+
+# 3. Load data for ref
+
+## 3-1. Load h5seurat
+
+```{r load h5seurat}
+#cells_ref <- LoadH5Seurat(paste0(prefix_load, "res.forseurat.v3.h5seurat"))
+load(paste0(prefix_load, "res_forseurat_v3_h5seurat.RData"))
+cells_ref
+```
+
+## 3-2. UMAP_ref
+
+```{r UMAP_ref}
+#DimPlot(cells_ref,
+#        reduction = "umap",
+#        group.by = "clusterL1",
+#        shuffle = TRUE,
+#        label = TRUE)
+#DimPlot(cells_ref,
+#        reduction = "umap",
+#        group.by = "clusterL2",
+#        shuffle = TRUE,
+#        label = TRUE)
+```
+
+# 4. Seurat analysis
+
+```{r Seurat analysis}
+obj <- CreateSeuratObject(cells_ref@assays$RNA@counts) %>%
+  SCTransform(assay = "RNA",
+              method = "glmGamPoi")
+
+obj.meta.data <- cells_ref@meta.data
+obj <- AddMetaData(obj,
+                   metadata = obj.meta.data)
+
+obj <- obj %>%
+  ScaleData() %>% 
+  RunPCA() %>%
+  RunHarmony.Seurat(group.by.vars = vars.obj,
+                    reduction = "pca",
+                    assay.use = "SCT",
+                    project.dim = FALSE) %>%
+  FindNeighbors(dims = 1:30,
+                reduction = "harmony") %>%
+  FindClusters(resolution = 0.5,
+               method = "igraph",
+               algorithm = 4)
+```
+
+```{r RunUMAP2}
+obj[['umap']] <- RunUMAP2(Embeddings(obj, "harmony")[, 1:30],
+                          assay = "RNA",
+                          umap.method = "uwot",
+                          return.model = TRUE)
+```
+
+```{r UMAP_obj}
+options(repr.plot.height = 4, repr.plot.width = 10)
+
+(
+  DimPlot(obj,
+         reduction = "umap",
+         group.by = "clusterL1",
+         shuffle = TRUE) +
+    guides(col = guide_legend(ncol = 2, override.aes = list(size=4))) +
+    labs(title = "Reference (clusterL1)")
+  ) +
+  (
+    DimPlot(obj,
+            reduction = "umap",
+            group.by = "clusterL2",
+            shuffle = TRUE) +
+      labs(title = "Reference (clusterL2)")
+    )
+
+ggsave(paste0(prefix_output, "_check_clusterL1L2_obj_Reference_Mapping.pdf"),
+       width = 10,
+       height = 5)
+```
+
+# 5. Make Symphony ref object
+
+```{r Make Symphony ref object}
+ref <- buildReferenceFromSeurat(obj,
+                                assay = "SCT",
+                                verbose = TRUE,
+                                save_umap = TRUE,
+                                save_uwot_path = "cache_symphony_sct.uwot")
+
+ref$normalization_method = "SCTransform"
+```
+
+# 6. Load data for query
+
+```{r Load data for query}
+query_obj <- readRDS(paste0(prefix_output, "_CD4T_AssayData.rds"))
+query_obj <- CreateSeuratObject(query_obj) %>%
+   SCTransform(assay = "RNA",
+               method = "glmGamPoi",
+               return.only.var.genes = FALSE)
+
+query_obj.meta.data <- readRDS(paste0(prefix_output, "_CD4T_MetaData.rds"))
+
+query_obj <- AddMetaData(query_obj,
+                         metadata = query_obj.meta.data)
+```
+
+# 7. Map Query
+
+```{r Map Query}
+query <- mapQuery(exp_query = query_obj$SCT@scale.data,
+                  metadata_query = query_obj@meta.data,
+                  ref_obj = ref,
+                  vars = vars.query,
+                  do_normalize = FALSE,
+                  return_type = "Seurat")
+```
+
+# 8. UMAP
+
+```{r UMAP}
+options(repr.plot.height = 4, repr.plot.width = 10)
+
+(
+  DimPlot(obj,
+          reduction = "umap",
+          group.by = "clusterL2",
+          shuffle = TRUE) +
+    labs(title = "Original Reference (clusterL2)")
+  ) +
+  (
+    DimPlot(query,
+            reduction = "umap",
+            group.by = vars.query,
+            shuffle = TRUE) +
+      labs(title = paste0("Mapped Query (", vars.query, ")"))
+    )
+
+ggsave(paste0(prefix_output, "_mapped_query_vars_batch_Reference_Mapping.pdf"),
+       width = 10,
+       height = 5)
+```
+
+# 9. Predict clusters
+
+```{r Predict clusters}
+query <- knnPredict.Seurat(query_obj = query,
+                           ref_obj = ref,
+                           label_transfer = "clusterL2")
+```
+
+```{r UMAP_predict_clusters}
+options(repr.plot.height = 4, repr.plot.width = 10)
+
+(
+  DimPlot(obj,
+          reduction = "umap",
+          group.by = "clusterL2",
+          shuffle = TRUE) +
+    labs(title = "Original Reference (clusterL2)")
+  ) +
+  (
+    DimPlot(query,
+            reduction = "umap",
+            group.by = "clusterL2",
+            shuffle = TRUE) +
+      labs(title = "Mapped Query (Predicted clusterL2)")
+    )
+
+ggsave(paste0(prefix_output, "_predict_clusterL2_Reference_Mapping.pdf"),
+       width = 10,
+       height = 5)
+```
+
+# 10. Feature Plot
+
+```{r FeaturePlot for Reference Mapping}
+options(repr.plot.width = 10, repr.plot.height = 8)
+
+FeaturePlot(object = query,
+            features = genes,
+            reduction = "umap",
+            ncol = 2,
+            raster = TRUE)
+
+ggsave(paste0(prefix_output, "_featureplot_query_Reference_Mapping.pdf"),
+       width = 20,
+       height = 40)
+```
+
+# 11. output files
+
+```{r output files}
+save(query,
+     file = paste0(prefix_output, "_query_Reference_Mapping.RData"))
+
+query@meta.data <- query@meta.data %>%
+  rename(project_name = orig.ident)
+
+query.meta.data <- query@meta.data
+
+query_clusterL2 <- query.meta.data %>%
+  group_by(.data[[c1]], clusterL2) %>%
+  count()
+query_clusterL2_prob <- query.meta.data %>%
+  group_by(.data[[c1]], clusterL2) %>%
+  summarise(clusterL2_prob.mean = mean(clusterL2_prob),
+            clusterL2_prob.max = max(clusterL2_prob),
+            clusterL2_prob.min = min(clusterL2_prob))
+query_clusterL2 <- left_join(query_clusterL2,
+                             query_clusterL2_prob,
+                             by = c(c1, "clusterL2"))  
+write.csv(query_clusterL2,
+          file = paste0(prefix_output, "_query_clusterL2_Reference_Mapping.csv"))
+
+query.meta.data <- query.meta.data %>%
+  select(all_of(c3)) %>%
+  group_by(.data[[c1]]) %>%
+  distinct()
+write.csv(query.meta.data,
+          file = paste0(prefix_output, "_query_metadata_Reference_Mapping.csv"))
+```
+
+```{r query_clusterL2}
+query_clusterL2
+```
+
+```{r query.meta.data}
+query.meta.data
+```
+
+# 12. Extraction of Treg
+
+```{r Extraction of Treg}
+query_Treg <- subset(query,
+                     clusterL2 %in% treg)
+
+query_Treg.meta.data <- query_Treg@meta.data
+  
+query_Treg.meta.data <- query_Treg.meta.data %>%
+  select(all_of(c3))
+
+query_Treg <- GetAssayData(object = query_Treg,
+                           slot = "data")
+```
+
+# 13. saveRDS
+
+```{r saveRDS}
+saveRDS(query_Treg.meta.data,
+        file = paste0(prefix_output, "_Treg_MetaData.rds"))
+
+saveRDS(query_Treg,
+        file = paste0(prefix_output, "_Treg_AssayData.rds"))
+```
+
+# 14. Save workspace
+
+```{r save.image}
+save.image(file = paste0(prefix_output, "_220423_Reference_Mapping.RData"))
+```
+
+# 15. sessionInfo
+
+```{r sessionInfo}
+sessionInfo()
+```
+
