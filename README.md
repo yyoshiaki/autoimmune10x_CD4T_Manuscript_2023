@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/679535045.svg)](https://zenodo.org/doi/10.5281/zenodo.10154466)
+
 # Codes for Manuscript
 
 ## Directories
